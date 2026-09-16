@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# 运行产物
+output/xml/*
+output/screenshots/*
+output/logs/*
+!output/**/.gitkeep
+
+# 大文件与个人配置
+data/*.apk
+config/config.json
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
