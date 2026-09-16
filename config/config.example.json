@@ -1,0 +1,7 @@
+{
+  "apk_path": "data/app.apk",
+  "package_name": "com.simplemobiletools.calculator",
+  "interact_rounds": 5,
+  "interact_interval": 2,
+  "device_serial": ""
+}
