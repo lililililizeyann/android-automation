@@ -14,6 +14,7 @@ output/xml/*
 output/screenshots/*
 output/logs/*
 !output/**/.gitkeep
+artifacts/
 
 # 大文件与个人配置
 data/*.apk
