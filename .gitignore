@@ -10,11 +10,8 @@ build/
 dist/
 
 # 运行产物
-output/xml/*
-output/screenshots/*
-output/logs/*
-!output/**/.gitkeep
-artifacts/
+output/*
+!output/.gitkeep
 
 # 大文件与个人配置
 data/*.apk

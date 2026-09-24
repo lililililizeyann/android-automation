@@ -1,7 +1,13 @@
 {
   "apk_path": "data/ApiDemos-debug.apk",
   "package_name": "io.appium.android.apis",
+  "output_dir": "output",
   "interact_rounds": 5,
   "interact_interval": 2,
-  "device_serial": ""
+  "device_serial": "",
+  "monitor": {
+    "logcat": true,
+    "network": true,
+    "wireless": true
+  }
 }

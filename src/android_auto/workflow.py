@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from android_auto import adb
+from android_auto.monitor import MonitorManager, MonitorSettings
 from android_auto.ui import UiNode, first_scrollable, first_text_node, parse_nodes
 
 
@@ -23,7 +24,8 @@ class WorkflowConfig:
     interact_rounds: int = 3
     interact_interval: float = 0.5
     device_serial: str | None = None
-    artifacts_dir: Path = Path("artifacts")
+    output_dir: Path = Path("output")
+    monitor: MonitorSettings = field(default_factory=MonitorSettings)
 
     @classmethod
     def from_json(cls, config_path: Path) -> WorkflowConfig:
@@ -42,12 +44,12 @@ class WorkflowConfig:
         apk_path = Path(apk_value)
         if not apk_path.is_absolute():
             apk_path = project_root / apk_path
-        artifacts_value = data.get("artifacts_dir", "artifacts")
-        if not isinstance(artifacts_value, str) or not artifacts_value:
-            raise WorkflowError("config.artifacts_dir must be a non-empty string")
-        artifacts_dir = Path(artifacts_value)
-        if not artifacts_dir.is_absolute():
-            artifacts_dir = project_root / artifacts_dir
+        output_value = data.get("output_dir", "output")
+        if not isinstance(output_value, str) or not output_value:
+            raise WorkflowError("config.output_dir must be a non-empty string")
+        output_dir = Path(output_value)
+        if not output_dir.is_absolute():
+            output_dir = project_root / output_dir
 
         serial_value = data.get("device_serial", "")
         if not isinstance(serial_value, str):
@@ -58,6 +60,13 @@ class WorkflowConfig:
             raise WorkflowError("config.interact_rounds must be an integer >= 2")
         if not isinstance(interval_value, (int, float)) or interval_value < 0:
             raise WorkflowError("config.interact_interval must be >= 0")
+        monitor_value = data.get("monitor", {})
+        if not isinstance(monitor_value, Mapping):
+            raise WorkflowError("config.monitor must be an object")
+        try:
+            monitor_settings = MonitorSettings.from_mapping(monitor_value)
+        except ValueError as exc:
+            raise WorkflowError(str(exc)) from exc
 
         return cls(
             apk_path=apk_path,
@@ -65,7 +74,8 @@ class WorkflowConfig:
             interact_rounds=rounds_value,
             interact_interval=float(interval_value),
             device_serial=serial_value or None,
-            artifacts_dir=artifacts_dir,
+            output_dir=output_dir,
+            monitor=monitor_settings,
         )
 
 
@@ -78,6 +88,7 @@ class S1Workflow:
         self.app_may_be_installed = False
         self.cleanup_errors: list[str] = []
         self.interaction_count = 0
+        self.monitor_manager: MonitorManager | None = None
 
     def run(self) -> None:
         """Run the workflow and raise one error if the run or cleanup fails."""
@@ -89,12 +100,15 @@ class S1Workflow:
             self._step(4, "Verifying installation", self._verify_install)
             self._step(5, "Launching ApiDemos", self._launch)
             self._step(6, "Waiting for app", self._wait_for_app)
-            self._step(7, "Interacting with UI", self._interact)
-            self._step(8, "Saving XML and screenshot", self._collect_artifacts)
+            self._step(7, "Starting monitors", self._start_monitors)
+            self._step(8, "Interacting with UI", self._interact)
+            self._step(9, "Stopping monitors", self._stop_monitors)
+            self._step(10, "Saving XML and screenshot", self._collect_output)
         except Exception as exc:  # cleanup must run for every post-install failure
             primary_error = exc
-            self._save_failure_artifacts()
+            self._save_failure_output()
         finally:
+            self._stop_monitors()
             self._cleanup()
 
         if primary_error is not None:
@@ -104,11 +118,28 @@ class S1Workflow:
             raise WorkflowError(detail) from primary_error
         if self.cleanup_errors:
             raise WorkflowError(f"cleanup failed: {'; '.join(self.cleanup_errors)}")
+        if self.monitor_manager is not None and self.monitor_manager.failures:
+            for failure in self.monitor_manager.failures:
+                print(f"Monitor warning: {failure}", flush=True)
         print("S1 workflow completed successfully.", flush=True)
 
     def _step(self, number: int, label: str, action: Callable[[], None]) -> None:
-        print(f"[{number}/10] {label}...", flush=True)
+        print(f"[{number}/12] {label}...", flush=True)
         action()
+
+    def _start_monitors(self) -> None:
+        if self.serial is None:
+            raise WorkflowError("Cannot start monitors before selecting a device")
+        self.monitor_manager = MonitorManager.from_settings(
+            self.config.monitor,
+            self.serial,
+            self.config.output_dir,
+        )
+        self.monitor_manager.start_all()
+
+    def _stop_monitors(self) -> None:
+        if self.monitor_manager is not None:
+            self.monitor_manager.stop_all()
 
     def _check_prerequisites(self) -> None:
         available = adb.devices()
@@ -128,9 +159,9 @@ class S1Workflow:
             raise WorkflowError(f"APK does not exist: {self.config.apk_path}")
         if self.config.apk_path.stat().st_size == 0:
             raise WorkflowError(f"APK is empty: {self.config.apk_path}")
-        self.config.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
         for stale_name in ("failure_ui.xml", "failure_screenshot.png"):
-            (self.config.artifacts_dir / stale_name).unlink(missing_ok=True)
+            (self.config.output_dir / stale_name).unlink(missing_ok=True)
 
     def _remove_previous(self) -> None:
         if not adb.is_installed(self.config.package_name, self.serial):
@@ -161,12 +192,12 @@ class S1Workflow:
             raise WorkflowError(f"App did not become foreground: {self.config.package_name}")
 
     def _interact(self) -> None:
-        before_path = self.config.artifacts_dir / "before_interaction.xml"
+        before_path = self.config.output_dir / "before_interaction.xml"
         views = self._wait_for_text_node(("Views",), before_path)
         self._tap_node(views)
         self._pause()
 
-        current_path = self.config.artifacts_dir / "after_views.xml"
+        current_path = self.config.output_dir / "after_views.xml"
         target = self._wait_for_text_node(
             ("Buttons", "TextFields", "Dialogs", "Controls"),
             current_path,
@@ -175,7 +206,7 @@ class S1Workflow:
         self._pause()
 
         for _ in range(max(0, self.config.interact_rounds - self.interaction_count)):
-            round_path = self.config.artifacts_dir / f"interaction_{self.interaction_count}.xml"
+            round_path = self.config.output_dir / f"interaction_{self.interaction_count}.xml"
             adb.dump_ui(round_path, self.serial)
             nodes = parse_nodes(round_path)
             scrollable = first_scrollable(nodes)
@@ -222,9 +253,9 @@ class S1Workflow:
             time.sleep(0.5)
         raise WorkflowError(f"Timed out waiting for UI text: {', '.join(candidates)}")
 
-    def _collect_artifacts(self) -> None:
-        ui_path = self.config.artifacts_dir / "ui.xml"
-        screenshot_path = self.config.artifacts_dir / "screenshot.png"
+    def _collect_output(self) -> None:
+        ui_path = self.config.output_dir / "ui.xml"
+        screenshot_path = self.config.output_dir / "screenshot.png"
         adb.dump_ui(ui_path, self.serial)
         adb.screenshot(screenshot_path, self.serial)
         self._assert_non_empty(ui_path, "UI XML")
@@ -233,13 +264,13 @@ class S1Workflow:
     def _cleanup(self) -> None:
         if not self.app_may_be_installed or self.serial is None:
             return
-        print("[9/10] Stopping application...", flush=True)
+        print("[11/12] Stopping application...", flush=True)
         try:
             adb.force_stop(self.config.package_name, self.serial)
         except Exception as exc:
             self.cleanup_errors.append(f"force-stop: {exc}")
 
-        print("[10/10] Uninstalling and verifying...", flush=True)
+        print("[12/12] Uninstalling and verifying...", flush=True)
         try:
             if adb.is_installed(self.config.package_name, self.serial):
                 adb.uninstall(self.config.package_name, self.serial)
@@ -248,14 +279,14 @@ class S1Workflow:
         except Exception as exc:
             self.cleanup_errors.append(f"uninstall: {exc}")
 
-    def _save_failure_artifacts(self) -> None:
+    def _save_failure_output(self) -> None:
         """Best-effort capture of the device state before cleanup."""
         try:
-            adb.dump_ui(self.config.artifacts_dir / "failure_ui.xml", self.serial)
+            adb.dump_ui(self.config.output_dir / "failure_ui.xml", self.serial)
         except Exception as exc:
             self.cleanup_errors.append(f"failure UI capture: {exc}")
         try:
-            adb.screenshot(self.config.artifacts_dir / "failure_screenshot.png", self.serial)
+            adb.screenshot(self.config.output_dir / "failure_screenshot.png", self.serial)
         except Exception as exc:
             self.cleanup_errors.append(f"failure screenshot capture: {exc}")
 
